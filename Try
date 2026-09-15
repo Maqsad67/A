@@ -1,0 +1,412 @@
+"""
+Manifest-driven arrival + size reconciliation for the control-file pipeline.
+
+WebHDFS split, because DataNode hostnames don't resolve from the K8s pods:
+  * LISTING  (LISTSTATUS)  -> NameNode only          -> WebHDFS
+  * CONTENT  (OPEN/CREATE) -> redirects to DataNode  -> SFTP instead
+
+Manifest name : <PREFIX>_<servercode>_<DDMMYYYY>.log   e.g. BALFINCORE_p_08092026.log
+Manifest line : "  186444 /fns/id/r/data/temp/BORTOGL_643"
+Scrap line    : "  145078 total"                        (no path -> skipped)
+Target name   : {base}_{date}_{code}_{stream}.gz        e.g. BORTOGL_09092026_n_643.gz
+"""
+
+from __future__ import annotations
+
+import base64
+import gzip
+import json
+import logging
+import re
+import stat
+import time
+from contextlib import contextmanager
+from datetime import datetime, timezone
+
+from airflow.providers.apache.hdfs.hooks.webhdfs import WebHDFSHook
+from airflow.providers.sftp.hooks.sftp import SFTPHook
+
+log = logging.getLogger(__name__)
+
+# --------------------------- config ---------------------------
+HDFS_CONN_ID = "HDFS"
+SFTP_CONN_ID = "sftp"
+SOURCE_DIR = "/media/CBSDATA"          # flat dir on staging: .gz + .log land here
+ARCHIVE_ROOT = "/media/FinCore/completed"   # fallback: <ARCHIVE_ROOT>/DD-MM-YYYY
+CONTROL_ROOT = "/CONTROL"              # manifests in HDFS: /CONTROL/DD-MM-YYYY
+DATA_ROOT = "/CBS-FILES"               # .gz in HDFS: /CBS-FILES/DD-MM-YYYY/{BANCS24,GLIF}
+DATA_SUFFIX = ".gz"
+XCOM_LIMIT_BYTES = 2_000_000
+
+# bootstrap_process pushes report_date as %d-%m-%Y - reuse it, don't re-query Oracle.
+# NOTE: formatted_date is %Y%m%d and is NOT the DDMMYYYY used in filenames.
+BOOTSTRAP_DATE_TASK = "bootstrap_process.fetch_fincore_etl_date"
+EXPECTED_LIST_TASK = "build_expected_list.main"   # stage_wrapper nests the operator
+
+MANIFEST_RE = re.compile(r"^[A-Za-z0-9]+_(?P<code>[A-Za-z])_(?P<date>\d{8})\.log$")
+LINE_RE = re.compile(r"^\s*(?P<count>\d+)\s+(?P<path>/\S+)\s*$")
+STREAM_RE = re.compile(r"^(?P<name>.+?)_(?P<stream>\d+)$")
+
+
+def _client():
+    return WebHDFSHook(webhdfs_conn_id=HDFS_CONN_ID).get_conn()
+
+
+@contextmanager
+def _sftp():
+    conn = SFTPHook(ssh_conn_id=SFTP_CONN_ID).get_conn()
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+# --------------------------- run date ---------------------------
+def _normalise_date(value) -> str:
+    """Accept a date/datetime or a common string form, return DDMMYYYY."""
+    if hasattr(value, "strftime"):
+        return value.strftime("%d%m%Y")
+    text = str(value).strip()
+    if re.fullmatch(r"\d{8}", text):
+        return text
+    for fmt in ("%d-%m-%Y", "%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(text[:10], fmt).strftime("%d%m%Y")
+        except ValueError:
+            continue
+    raise ValueError(f"Cannot interpret run_date {value!r}")
+
+
+def resolve_run_date(context) -> str:
+    """DDMMYYYY from bootstrap's etl_date. Never derived from logical_date."""
+    ti = context["ti"]
+    for key in ("report_date", "etl_date"):
+        raw = ti.xcom_pull(task_ids=BOOTSTRAP_DATE_TASK, key=key)
+        if raw:
+            return _normalise_date(raw)
+    raise ValueError(
+        f"No etl_date/report_date in XCom from {BOOTSTRAP_DATE_TASK!r} - "
+        "check the task id and that bootstrap succeeded."
+    )
+
+
+def _dashed(run_date: str) -> str:
+    """08092026 -> 08-09-2026"""
+    return f"{run_date[:2]}-{run_date[2:4]}-{run_date[4:]}"
+
+
+def _control_dir(run_date: str) -> str:
+    return f"{CONTROL_ROOT}/{_dashed(run_date)}"
+
+
+def _data_dir(run_date: str) -> str:
+    """Parent of the BANCS24 / GLIF subdirs - listed recursively."""
+    return f"{DATA_ROOT}/{_dashed(run_date)}"
+
+
+# --------------------------- HDFS: listing only ---------------------------
+def _entry(item):
+    """Normalise one listing entry to (name, status) across hdfscli return shapes."""
+    if isinstance(item, (tuple, list)) and len(item) == 2:
+        a, b = item
+        if isinstance(a, str) and isinstance(b, dict):
+            return a, b
+        if isinstance(b, str) and isinstance(a, dict):
+            return b, a
+    if isinstance(item, dict):
+        return item.get("pathSuffix", ""), item
+    raise TypeError(f"Unexpected listing entry from WebHDFS: {item!r}")
+
+
+def _hdfs_files(client, root: str, max_depth: int = 2) -> dict[str, dict]:
+    """{filename: status} under root, recursing into subdirs. status gains '_dir'."""
+    found: dict[str, dict] = {}
+    pending = [(root, 0)]
+    while pending:
+        path, depth = pending.pop()
+        try:
+            entries = client.list(path, status=True)
+        except Exception as exc:
+            log.warning("Could not list %s: %s", path, exc)
+            continue
+        for item in entries:
+            name, status = _entry(item)
+            full = f"{path.rstrip('/')}/{name}"
+            if status.get("type") == "DIRECTORY":
+                if depth < max_depth:
+                    pending.append((full, depth + 1))
+            elif status.get("type") == "FILE":
+                if name in found:
+                    log.warning(
+                        "Duplicate filename %s in both %s and %s",
+                        name, found[name]["_dir"], path,
+                    )
+                found[name] = {**status, "_dir": path}
+    return found
+
+
+def _quiet_for(status: dict, seconds: int) -> bool:
+    """True when HDFS has not touched this file for `seconds`."""
+    return time.time() * 1000 - status.get("modificationTime", 0) >= seconds * 1000
+
+
+# --------------------------- staging server ---------------------------
+def _source_dirs(run_date: str) -> list[str]:
+    """Live drop dir first, then the day's completed/ archive it gets moved to."""
+    return [SOURCE_DIR, f"{ARCHIVE_ROOT}/{_dashed(run_date)}"]
+
+
+def _listdir(sftp, path: str):
+    try:
+        return sftp.listdir_attr(path)
+    except IOError as exc:
+        log.info("Staging dir %s not available: %s", path, exc)
+        return []
+
+
+def _source_sizes(wanted: set[str], run_date: str) -> dict[str, int]:
+    """{filename: st_size}, searching the live dir then the archive. First win."""
+    found: dict[str, int] = {}
+    per_dir: dict[str, int] = {}
+    with _sftp() as sftp:
+        for directory in _source_dirs(run_date):
+            for attr in _listdir(sftp, directory):
+                if (attr.filename in wanted and attr.filename not in found
+                        and stat.S_ISREG(attr.st_mode)):
+                    found[attr.filename] = attr.st_size
+                    per_dir[directory] = per_dir.get(directory, 0) + 1
+    if len(per_dir) > 1:
+        log.info("Data files split across staging dirs: %s", str(per_dir))
+    return found
+
+
+def _read_source(sftp, directory: str, name: str) -> str:
+    with sftp.open(f"{directory}/{name}", "r") as fh:
+        raw = fh.read()
+    return raw.decode("utf-8") if isinstance(raw, bytes) else raw
+
+
+def _write_text(mode: str, path: str, text: str) -> str:
+    if mode == "hdfs":
+        # needs DataNode DNS to resolve from the pods - CREATE redirects there
+        _client().write(path, data=text, overwrite=True, encoding="utf-8")
+    else:
+        with _sftp() as sftp:
+            parent = path.rsplit("/", 1)[0]
+            try:
+                sftp.stat(parent)
+            except IOError:
+                sftp.mkdir(parent)
+            with sftp.open(path, "w") as fh:
+                fh.write(text)
+    return path
+
+
+def _pack(names: list[str]) -> str:
+    blob = base64.b64encode(
+        gzip.compress(json.dumps(names).encode("utf-8"), compresslevel=9)
+    ).decode("ascii")
+    if len(blob) > XCOM_LIMIT_BYTES:
+        raise ValueError(f"Packed expected list is {len(blob)} bytes - use an external store.")
+    return blob
+
+
+def _unpack(blob: str) -> list[str]:
+    return json.loads(gzip.decompress(base64.b64decode(blob)).decode("utf-8"))
+
+
+def _expected_name(base: str, date: str, code: str) -> str:
+    """BORTOGL_643 + 09092026 + n -> BORTOGL_09092026_n_643.gz"""
+    m = STREAM_RE.match(base)
+    if m:
+        return f"{m.group('name')}_{date}_{code}_{m.group('stream')}{DATA_SUFFIX}"
+    return f"{base}_{date}_{code}{DATA_SUFFIX}"
+
+
+def _find_manifests(sftp, run_date: str) -> dict[str, str]:
+    """{manifest_name: directory} for run_date. /media/CBSDATA wins over the archive."""
+    found: dict[str, str] = {}
+    for directory in _source_dirs(run_date):
+        for attr in _listdir(sftp, directory):
+            if not stat.S_ISREG(attr.st_mode) or attr.st_size == 0:
+                continue
+            m = MANIFEST_RE.match(attr.filename)
+            if m and m.group("date") == run_date and attr.filename not in found:
+                found[attr.filename] = directory
+    per_dir: dict[str, int] = {}
+    for d in found.values():
+        per_dir[d] = per_dir.get(d, 0) + 1
+    log.info("Manifests located: %s", str(per_dir or "none"))
+    return found
+
+
+# ==================== stage callables ====================
+def wait_for_manifests(min_manifests: int = 32, quiet_seconds: int = 120, **context):
+    run_date = resolve_run_date(context)
+    control_dir = _control_dir(run_date)
+
+    listing = _hdfs_files(_client(), control_dir)
+    manifests = {
+        n: st for n, st in listing.items()
+        if (m := MANIFEST_RE.match(n)) and m.group("date") == run_date
+    }
+    log.info("Found %d/%d manifests for %s in %s",
+             len(manifests), min_manifests, run_date, control_dir)
+
+    if len(manifests) < min_manifests:
+        return False
+    empty = [n for n, st in manifests.items() if st["length"] == 0]
+    if empty:
+        log.info("Still zero bytes (first 10): %s", empty[:10])
+        return False
+    unsettled = [n for n, st in manifests.items() if not _quiet_for(st, quiet_seconds)]
+    if unsettled:
+        log.info("Written within the last %ds (first 10): %s", quiet_seconds, unsettled[:10])
+        return False
+
+    log.info("All %d manifests present and quiet.", len(manifests))
+    return True
+
+
+def build_expected_list(**context):
+    run_date = resolve_run_date(context)
+    entries: dict[str, dict] = {}
+    skipped_scrap = skipped_zero = 0
+
+    with _sftp() as sftp:
+        located = _find_manifests(sftp, run_date)
+        manifests = sorted(located)
+        log.info("Parsing %d manifests for %s.", len(manifests), run_date)
+        if not manifests:
+            raise FileNotFoundError(
+                f"No manifests dated {run_date} in {' or '.join(_source_dirs(run_date))}"
+            )
+
+        for manifest in manifests:
+            meta = MANIFEST_RE.match(manifest)
+            date, code = meta.group("date"), meta.group("code")
+            for raw in _read_source(sftp, located[manifest], manifest).splitlines():
+                if not raw.strip():
+                    continue
+                line = LINE_RE.match(raw)
+                if not line:                     # "145078 total" and friends
+                    skipped_scrap += 1
+                    continue
+                records = int(line.group("count"))
+                if records == 0:
+                    skipped_zero += 1
+                    continue
+                base = line.group("path").rsplit("/", 1)[-1]
+                name = _expected_name(base, date, code)
+                entries[name] = {"records": records, "manifest": manifest}
+
+    hdfs_count = sum(
+        1 for n in _hdfs_files(_client(), _control_dir(run_date))
+        if (m := MANIFEST_RE.match(n)) and m.group("date") == run_date
+    )
+    if hdfs_count != len(manifests):
+        log.warning("Manifest count differs: %d on staging, %d in the HDFS control dir",
+                    len(manifests), hdfs_count)
+
+    log.info("Expected files: %d (skipped %d scrap lines, %d zero-record entries)",
+             len(entries), skipped_scrap, skipped_zero)
+    if not entries:
+        raise ValueError(f"No usable manifest entries found for {run_date}")
+
+    names = sorted(entries)
+    blob = _pack(names)
+    log.info("Packed %d names into %d bytes of XCom.", len(names), len(blob))
+    return {
+        "run_date": run_date,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "manifest_count": len(manifests),
+        "expected_count": len(names),
+        "names_gz": blob,
+    }
+
+
+def _load_expected(context) -> list[str]:
+    ref = context["ti"].xcom_pull(task_ids=EXPECTED_LIST_TASK)
+    if not ref or "names_gz" not in ref:
+        raise ValueError(f"No expected list in XCom from {EXPECTED_LIST_TASK!r}")
+    return _unpack(ref["names_gz"])
+
+
+def _reconcile(context, quiet_seconds: int):
+    run_date = resolve_run_date(context)
+    expected = _load_expected(context)
+    wanted = set(expected)
+
+    src = _source_sizes(wanted, run_date)                        # live dir + archive
+    found = _hdfs_files(_client(), _data_dir(run_date))           # one WebHDFS walk
+    found = {n: st for n, st in found.items() if n in wanted}
+
+    hdfs = {n: st["length"] for n, st in found.items()}
+    where = {n: st["_dir"] for n, st in found.items()}
+
+    missing_src = [n for n in expected if src.get(n, 0) == 0]
+    missing_hdfs = [n for n in expected if hdfs.get(n, 0) == 0]
+    mismatched = [(n, src[n], hdfs[n]) for n in expected
+                  if n in src and n in hdfs and src[n] != hdfs[n]]
+    unsettled = [n for n, st in found.items() if not _quiet_for(st, quiet_seconds)]
+    return run_date, expected, src, hdfs, where, missing_src, missing_hdfs, mismatched, unsettled
+
+
+def wait_for_size_match(quiet_seconds: int = 120, **context):
+    (_rd, expected, _src, _hdfs, where,
+     missing_src, missing_hdfs, mismatched, unsettled) = _reconcile(context, quiet_seconds)
+
+    by_dir: dict[str, int] = {}
+    for d in where.values():
+        by_dir[d] = by_dir.get(d, 0) + 1
+    log.info("%d expected | staging %d | hdfs %d %s | mismatches %d | still writing %d",
+             len(expected), len(expected) - len(missing_src),
+             len(expected) - len(missing_hdfs), str(dict(sorted(by_dir.items()))),
+             len(mismatched), len(unsettled))
+    if missing_src:
+        log.info("Not on staging yet (first 20): %s", missing_src[:20])
+    if missing_hdfs:
+        log.info("Not in HDFS yet (first 20): %s", missing_hdfs[:20])
+    if mismatched:
+        log.info("Size mismatch (first 20, name/staging/hdfs): %s", mismatched[:20])
+
+    return not (missing_src or missing_hdfs or mismatched or unsettled)
+
+
+def write_confirmation(confirm_to: str = "sftp",
+                       confirm_dir: str = "/var/tmp/airflow-cbs",
+                       quiet_seconds: int = 120,
+                       **context):
+    run_date, expected, src, hdfs, where, *_rest = _reconcile(context, quiet_seconds)
+
+    total = sum(hdfs[n] for n in expected)
+    by_dir: dict[str, int] = {}
+    for d in where.values():
+        by_dir[d] = by_dir.get(d, 0) + 1
+
+    lines = [
+        f"run_date={run_date}",
+        f"confirmed_at={datetime.now(timezone.utc).isoformat()}",
+        f"file_count={len(expected)}",
+        f"total_bytes={total}",
+        *[f"dir_count={d}={c}" for d, c in sorted(by_dir.items())],
+        "",
+        "filename|staging_bytes|hdfs_bytes|hdfs_dir",
+        *[f"{n}|{src[n]}|{hdfs[n]}|{where[n]}" for n in expected],
+    ]
+    name = f"_TRANSFER_CONFIRMED_{run_date}.log"
+    path = (f"{_control_dir(run_date)}/{name}" if confirm_to == "hdfs"
+            else f"{confirm_dir.rstrip('/')}/{name}")
+    written = _write_text(confirm_to, path, "\n".join(lines) + "\n")
+
+    log.info("CONFIRMED run_date=%s files=%d total_bytes=%d %s -> %s",
+             run_date, len(expected), total, str(dict(sorted(by_dir.items()))), written)
+    log.info("First rows:\n%s", "\n".join(lines[6:26]))
+
+    return {
+        "run_date": run_date,
+        "file_count": len(expected),
+        "total_bytes": total,
+        "by_dir": dict(sorted(by_dir.items())),
+        "confirmation_path": written,
+    }
