@@ -1,0 +1,298 @@
+# import os
+# import sys
+from datetime import datetime
+# sys.path.insert(0,os.path.dirname(os.path.abspath("/opt/airflow/dags/utils/oracle_util.py")))
+
+# Custom Imports
+from utils.oracle_util import get_oracle_hook
+KAFKA_CONN_ID = "kafka_conn"
+KAFKA_TOPIC = "airflow-events"
+
+
+
+def detect_trigger_source(**context):
+
+    dag_run = context["dag_run"]
+    
+    print("DAG_RUN::{}",dag_run)
+
+    if dag_run.run_type == "scheduled":
+
+        source = "SCHEDULER"
+
+    elif dag_run.run_type == "manual":
+
+        conf = dag_run.conf or {}
+
+        source = "FINCORE_BE" if conf.get("triggered_by") == "FINCORE_BE" else "AIRFLOW_UI"
+
+    else:
+
+        source = "UNKNOWN"
+
+    context["ti"].xcom_push(key="trigger_source", value=source)
+
+    print("Trigger source:", source)
+    
+def branch_on_trigger(**context):
+
+    source = context["ti"].xcom_pull(
+
+        task_ids="bootstrap_process.detect_trigger_source",
+
+        key="trigger_source"
+
+    )
+
+    print(f"Source::::::::::::::{source}")
+    
+    base_process="bootstrap_process."
+    return base_process+"wait_for_process_run" if source == "FINCORE_BE" else base_process+"create_process_run"     
+
+def fetch_fincore_etl_date(**context):
+   print("Fetch Started") 
+   ti = context["ti"]
+   hook = get_oracle_hook()
+   records = hook.get_records(
+       "SELECT etl_date FROM fincore_date"
+   )
+   
+#    if not records:
+#        raise AirflowFailException("FINCORE_DATE table is empty")
+   etl_date = records[0][0]  
+   formatted_date = etl_date.strftime('%Y%m%d')
+   report_date = etl_date.strftime('%d-%m-%Y')
+   ti.xcom_push(key="etl_date", value=etl_date)
+   ti.xcom_push(key="formatted_date", value=formatted_date)
+   ti.xcom_push(key="report_date", value=report_date)
+   print("Resolved etl_date:", etl_date) 
+   
+# import os
+# import sys
+
+
+from airflow.utils.task_group import TaskGroup
+from airflow.operators.python import PythonOperator, BranchPythonOperator
+from airflow.providers.common.sql.sensors.sql import SqlSensor
+from airflow.utils.trigger_rule import TriggerRule
+
+# sys.path.insert(0,os.path.dirname(os.path.abspath("/opt/airflow/dags/utils/bootstrap_util.py")))
+# sys.path.insert(0,os.path.dirname(os.path.abspath("/opt/airflow/dags/utils/process_run_util.py")))
+# Custom Imports
+from utils.bootstrap_util import branch_on_trigger,detect_trigger_source,fetch_fincore_etl_date
+from utils.process_run_util import insert_process_run,resolve_process_run_id
+
+
+
+def bootstrap_process_group(
+   *,
+   dag,
+   group_id: str = "bootstrap_process",
+   process_id
+):
+   """
+   Bootstrap phase for all pipelines.
+   Guarantees:
+     - PROCESS_CONTEXT XCom exists
+     - process_run_id is resolved
+     - etl_date & user_date are available
+   """
+   with TaskGroup(group_id=group_id, dag=dag) as tg:
+       # -------------------------------------------------
+       # 1. Fetch ETL / User date
+       # -------------------------------------------------
+       
+       print("Fetching ETL Date")
+       
+       fetch_etl_date = PythonOperator(
+           task_id="fetch_fincore_etl_date",
+           python_callable=fetch_fincore_etl_date,
+           do_xcom_push=True,
+     
+
+       )
+       # Expected pushes:
+       #   key="etl_date"
+       #   key="formatted_date"
+       
+       # -------------------------------------------------
+       # 2. Detect trigger source
+       # -------------------------------------------------
+       detect_trigger = PythonOperator(
+           task_id="detect_trigger_source",
+           python_callable=detect_trigger_source,
+       )
+       # Expected push:
+       #   key="trigger_source" (AIRFLOW | SPRING_BOOT | UI)
+       
+       
+       # -------------------------------------------------
+       # 3. Branch on trigger source
+       # -------------------------------------------------
+       branch = BranchPythonOperator(
+           task_id="branch_on_trigger",
+           python_callable=branch_on_trigger,
+       )
+       # Returns:
+       #   "create_process_run" OR "wait_for_process_run"
+       
+       # -------------------------------------------------
+       # 4A. Scheduler / UI path (entry should be created by airflow )
+       # -------------------------------------------------
+       create_process_run = PythonOperator(
+           task_id="create_process_run",
+           python_callable=insert_process_run,
+           do_xcom_push=False,
+           op_kwargs={"process_id": process_id},
+       )
+       # This does NOT push process_run_id
+       # Spring Boot already created it
+       # -------------------------------------------------
+       # 4B. Spring Boot path (Entry made by spring boot - wait for entry)
+       # -------------------------------------------------
+       wait_for_process_run = SqlSensor(
+           task_id="wait_for_process_run",
+           conn_id="oracle_conn",
+           sql="""
+               SELECT 1
+               FROM process_run
+               WHERE airflow_run_id = '{{ run_id }}'
+           """,
+           poke_interval=5,
+           timeout=600,
+           mode="reschedule",
+       )
+       
+       # -------------------------------------------------
+       # 5. Resolve process_run_id + push PROCESS_CONTEXT
+       # -------------------------------------------------
+       resolve_process_run = PythonOperator(
+           task_id="resolve_process_run_id",
+           python_callable=resolve_process_run_id,
+           trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
+           do_xcom_push=True,
+       )
+       # Expected push:
+       #   key="PROCESS_CONTEXT"
+       
+       # -------------------------------------------------
+       # Wiring
+       # -------------------------------------------------
+       fetch_etl_date >> detect_trigger >> branch
+       branch >> [create_process_run, wait_for_process_run]
+       [create_process_run, wait_for_process_run] >> resolve_process_run
+       # Expose ONLY the contract boundary
+       tg.resolve = resolve_process_run
+   return tg   
+   
+   
+# import os
+# import sys
+from airflow.utils.task_group import TaskGroup
+from airflow.operators.empty import EmptyOperator
+from airflow.operators.python import ShortCircuitOperator
+from airflow.utils.trigger_rule import TriggerRule
+from airflow.providers.cncf.kubernetes.operators.spark_kubernetes import SparkKubernetesOperator
+from airflow.providers.apache.hdfs.sensors.web_hdfs import WebHdfsSensor
+
+
+
+# sys.path.insert(0,os.path.dirname(os.path.abspath("/opt/airflow/dags/utils/xcom_util.py")))
+# sys.path.insert(0,os.path.dirname(os.path.abspath("/opt/airflow/dags/utils/callback_util.py")))
+
+
+# Custom Imports
+from utils.xcom_util import get_process_run_id
+from utils.callback_util import log_stage_start,log_stage_success,log_stage_failure
+
+
+
+
+
+
+def _get_process_run_id(context):
+    """
+    Wrapper internal helper using the centralized utility.
+    """
+    try:
+        # Use your utility, but explicitly target the resolver task
+        pr_id = get_process_run_id(context, task_id="bootstrap_process.resolve_process_run_id")
+        
+        if not pr_id:
+            raise ValueError("ID is empty")
+        return pr_id
+        
+    except Exception as e:
+        # Provide a clear error so you know EXACTLY why it failed in the logs
+        raise ValueError(
+            f"process_run_id not found via utility from 'resolve_process_run_id'. "
+            f"Check if task succeeded. Error: {str(e)}"
+        )
+
+# ---------------------------------------------------------
+
+# STAGE WRAPPER
+
+# ---------------------------------------------------------
+
+def stage_wrapper(
+    *,
+    dag,
+    stage_id: str,
+    operator_cls,
+    operator_kwargs: dict,
+    stage_meta: dict,
+):
+    """
+    Wraps ANY operator with:
+    - start insert
+    - success update
+    - failure update
+    - clean DAG exits
+    """
+    def _on_execute(context):    
+        ti = context['ti']
+    # Pull XCom from this specific task, from any previous attempt
+        started_key = f"__stage_started__::{stage_id}"
+        print(f"Started Key:{started_key}")
+        print(f"TI:{ti}")
+        if ti.xcom_pull(key=started_key):
+       # Stage already marked STARTED
+            return       
+        process_run_id = _get_process_run_id(context)
+        log_stage_start(process_run_id,stage_id,stage_meta,context=context)
+        
+        ti.xcom_push(key=started_key, value=True)
+    def _on_success(context):
+        process_run_id = _get_process_run_id(context)
+        log_stage_success(process_run_id,stage_id,stage_meta,context=context)
+
+    def _on_failure(context):
+        process_run_id = _get_process_run_id(context)
+        log_stage_failure(process_run_id,stage_id,stage_meta,context=context)
+
+    with TaskGroup(group_id=stage_id, dag=dag) as tg:
+        main = operator_cls(
+            task_id="main",
+            on_execute_callback=_on_execute,
+            on_success_callback=_on_success,
+            on_failure_callback=_on_failure,
+            **operator_kwargs,
+        )
+
+        stage_success = EmptyOperator(
+            task_id="stage_success",
+            trigger_rule=TriggerRule.ALL_SUCCESS,
+        )
+
+        stage_failure = EmptyOperator(
+            task_id="stage_failure",
+            trigger_rule=TriggerRule.ONE_FAILED,
+        )
+
+        main >> stage_success
+        main >> stage_failure
+        tg.stage_success = stage_success
+        tg.stage_failure = stage_failure
+    return tg
+   
