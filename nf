@@ -1,0 +1,1 @@
+${rec.1:substringAfterLast('/'):matches('.*_[0-9]+'):ifElse(${rec.1:substringAfterLast('/'):substringBeforeLast('_'):append('_'):append(${manifest.date}):append('_'):append(${server.code}):append('_'):append(${rec.1:substringAfterLast('/'):substringAfterLast('_')})}, ${rec.1:substringAfterLast('/'):append('_'):append(${manifest.date}):append('_'):append(${server.code})})}
