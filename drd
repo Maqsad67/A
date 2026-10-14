@@ -1,0 +1,144 @@
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from datetime import datetime, timedelta
+import requests
+import time
+
+# ================================================================
+# CHANGE ONLY THIS DATE
+# ================================================================
+INGEST_DATE = "2026-05-11"
+
+# ================================================================
+# CONFIG
+# ================================================================
+ROUTER   = "https://10.190.224.90:8898"
+VERIFY_SSL = False
+
+DATASOURCES = {
+    "GLIF":        "hdfs://fincore/data-lake/bulk-data/{date}/GLIF/*/*.parquet",
+    "CBS_BORTOGL": "hdfs://fincore/data-lake/bulk-data/{date}/CBS/BORTOGL/*/*.parquet",
+    "CBS_GLCCCTA": "hdfs://fincore/data-lake/bulk-data/{date}/CBS/GLCCCTA/*/*.parquet",
+    "CBS_GLCCGEN": "hdfs://fincore/data-lake/bulk-data/{date}/CBS/GLCCGEN/*/*.parquet",
+    "CBS_INVTOGL": "hdfs://fincore/data-lake/bulk-data/{date}/CBS/INVTOGL/*/*.parquet",
+}
+
+# ================================================================
+# BUILD SPEC
+# ================================================================
+def build_spec(datasource: str, date: str) -> dict:
+    print(f"build_spec function called DATE ={date}")
+    next_date = (
+        datetime.strptime(date, "%Y-%m-%d") + timedelta(days=1)
+    ).strftime("%Y-%m-%d")
+
+    print(f"build_spec  next_date ={next_date}")
+    return {
+        "type": "index_parallel",
+        "spec": {
+            "ioConfig": {
+                "type": "index_parallel",
+                "inputSource": {
+                    "type": "hdfs",
+                    "paths": DATASOURCES[datasource].format(date=date)
+                },
+                "inputFormat": {"type": "parquet"},
+                "appendToExisting": True
+            },
+            "tuningConfig": {
+                "type": "index_parallel",
+                "maxNumConcurrentSubTasks": 9,
+                "maxRowsInMemory": 25000,
+                "maxBytesInMemory": 536870912,
+                "partitionsSpec": {
+                    "type": "dynamic",
+                    "maxRowsPerSegment": 3000000
+                }
+            },
+            "dataSchema": {
+                "dataSource": datasource,
+                "timestampSpec": {
+                    "column": "!!!_no_such_column_!!!",
+                    "missingValue": f"{date}T00:00:00Z"
+                },
+                "dimensionsSpec": {
+                    "dimensions": [],
+                    "includeAllDimensions": True
+                },
+                "granularitySpec": {
+                    "queryGranularity": "none",
+                    "rollup": False,
+                    "segmentGranularity": "day",
+                    "intervals": [f"{date}/{next_date}"]
+                }
+            }
+        },
+        "context": {
+            "forceTimeChunkLock": False,
+            "useLineageBasedSegmentAllocation": True
+        }
+    }
+
+# ================================================================
+# SUBMIT AND WAIT
+# ================================================================
+def submit_and_wait(datasource: str, date: str):
+    print(f"submit_and_wait function ::  DATE ={date}")
+    spec = build_spec(datasource, date)
+    print(f"JSON spec ::  spec ={spec}")
+    
+
+    r = requests.post(
+        f"{ROUTER}/druid/indexer/v1/task",
+        json=spec,
+        verify=VERIFY_SSL,
+        headers={"Content-Type": "application/json"}
+    )
+    r.raise_for_status()
+    task_id = r.json()["task"]
+    print(f"[{datasource}] {date} submitted -> {task_id}")
+
+    while True:
+        time.sleep(30)
+        resp = requests.get(
+            f"{ROUTER}/druid/indexer/v1/task/{task_id}/status",
+            verify=VERIFY_SSL
+        )
+        s = resp.json()["status"]["status"]
+        print(f"  [{datasource}] {date} -> {s}")
+
+        if s == "SUCCESS":
+            print(f"  [{datasource}] {date} DONE")
+            return task_id
+        elif s == "FAILED":
+            raise Exception(
+                f"[{datasource}] {date} FAILED - task: {task_id}"
+            )
+
+# ================================================================
+# TASK FUNCTION
+# ================================================================
+def ingest(datasource: str):
+    print(f"INGEST DATE ={INGEST_DATE}")
+    submit_and_wait(datasource, INGEST_DATE)
+
+# ================================================================
+# DAG
+# All 5 datasources run in parallel for INGEST_DATE
+# ================================================================
+with DAG(
+    dag_id="druid_single_day_ingest",
+    start_date=datetime(2026, 5, 27),
+    schedule=None,
+    catchup=False,
+    max_active_tasks=5,
+    tags=["druid", "single-day"]
+) as dag:
+
+    for ds in DATASOURCES:
+        PythonOperator(
+            task_id=f"ingest_{ds}",
+            python_callable=ingest,
+            op_kwargs={"datasource": ds}
+        )
+
